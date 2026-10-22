@@ -34,6 +34,7 @@ import { ListIntentsDto } from "../intents/dto/list-intents.dto";
 import { RegisterSolverDto } from "./dto/register-solver.dto";
 import { UpdateSolverDto } from "./dto/update-solver.dto";
 import { UpdateSolverStatusDto } from "./dto/update-solver-status.dto";
+import { UpdateSolverInventoryDto } from "./dto/update-solver-inventory.dto";
 
 const WINDOW_SECONDS: Record<Exclude<LeaderboardWindow, "all">, number> = {
 	"24h": 24 * 60 * 60,
@@ -142,7 +143,18 @@ export class SolversController {
 		if (!solver.isActive) throw new ForbiddenException("Solver is not active");
 
 		const open = await this.intentsService.getByState("open");
-		const eligible = open.filter((intent) => solverSupports(solver, intent.srcChain, intent.srcToken.symbol));
+		const eligible = open.filter((intent) => {
+			if (!solverSupports(solver, intent.srcChain, intent.srcToken.symbol)) return false;
+			const declared = (solver.inventory ?? []).find(
+				(entry) => entry.chain === intent.srcChain && entry.token === intent.srcToken.symbol,
+			);
+			if (!declared) return true;
+			try {
+				return BigInt(intent.srcAmount) <= BigInt(declared.availableAmount);
+			} catch {
+				return true;
+			}
+		});
 		const limit = Math.min(dto.limit ?? 20, 100);
 		const offset = dto.offset ?? 0;
 		if ((dto.limit ?? 20) > 100) {
@@ -191,6 +203,40 @@ export class SolversController {
 		return updated;
 	}
 
+	@Patch(":address/inventory")
+	@ApiOperation({ summary: "Declare per-token inventory depth" })
+	@ApiOkResponse({ description: "Updated solver record" })
+	@ApiBadRequestResponse({ description: "Invalid inventory body" })
+	@ApiUnauthorizedResponse({ description: "Missing or invalid signature" })
+	@ApiNotFoundResponse({ description: "Solver not found" })
+	async updateInventory(
+		@Param("address") address: string,
+		@Body() dto: UpdateSolverInventoryDto,
+	) {
+		const solver = await this.solversService.get(address);
+		if (!solver) throw new NotFoundException("Solver not found");
+
+		const message = buildUpdateSolverMessage(address);
+		const signers = [address, ...(solver.delegatedSigners ?? [])];
+		let authorized = false;
+		for (const signer of signers) {
+			try {
+				verifyStellarSignature(signer, message, dto.signature);
+				authorized = true;
+				break;
+			} catch {
+				// try next candidate signer
+			}
+		}
+		if (!authorized) {
+			throw new ForbiddenException("Missing or invalid signature");
+		}
+
+		const updated = await this.solversService.update(address, { inventory: dto.inventory });
+		if (!updated) throw new NotFoundException("Solver not found");
+		return updated;
+	}
+
 	@Post(":address/delegates")
 	@ApiOperation({ summary: "Add a delegated operational signer" })
 	@ApiOkResponse({ description: "Updated solver record" })
@@ -230,52 +276,26 @@ export class SolversController {
 		return solver;
 	}
 
-	@Get(":address/stats")
-	async getSolverStats(@Param("address") address: string, @Query("window") window?: string) {
-		const solver = await this.solversService.get(address);
+	@Patch(":address/status")
+	@ApiOperation({ summary: "Update solver active status" })
+	@ApiOkResponse({ description: "Updated solver record" })
+	@ApiUnauthorizedResponse({ description: "Missing or invalid signature" })
+	@ApiNotFoundResponse({ description: "Solver not found" })
+	async updateStatus(@Param("address") address: string, @Body() dto: UpdateSolverStatusDto) {
+		verifyStellarSignature(
+			address,
+			buildSolverStatusMessage(address, dto.isActive),
+			dto.signature,
+		);
+		const solver = await this.solversService.update(address, { isActive: dto.isActive });
 		if (!solver) throw new NotFoundException("Solver not found");
-
-		const resolvedWindow = this.normalizeWindow(window ?? "all");
-		const intents = await this.intentsService.getAll();
-		const now = Math.floor(Date.now() / 1000);
-		const cutoff = resolvedWindow === "all" ? 0 : now - WINDOW_SECONDS[resolvedWindow];
-		const recentIntents = intents.filter((intent) => {
-			if (intent.solver !== address) return false;
-			const timestamp = intent.state === "filled" ? intent.filledAt ?? intent.createdAt : intent.slashedAt ?? intent.createdAt;
-			return resolvedWindow === "all" || timestamp >= cutoff;
-		});
-
-		const completed = recentIntents.filter((intent) => intent.state === "filled");
-		const fillsCompleted = completed.length;
-		const fillsFailed = recentIntents.filter((intent) => intent.state === "slashed").length;
-		const total = fillsCompleted + fillsFailed;
-		const successRate = total > 0 ? fillsCompleted / total : 0;
-		const ageDays = Math.max(0, (now - solver.registeredAt) / 86400);
-
-		return {
-			address: solver.address,
-			name: solver.name,
-			fillsCompleted,
-			fillsFailed,
-			successRate: Number(successRate.toFixed(4)),
-			reputationScore: Number((successRate * Math.exp(-ageDays / 180)).toFixed(4)),
-			totalVolume: completed.reduce((sum, intent) => sum + BigInt(intent.fillAmount ?? "0"), 0n).toString(),
-			avgFillTime: completed.filter((intent) => intent.filledAt != null).length
-				? Math.round(
-						completed
-							.filter((intent) => intent.filledAt != null)
-							.reduce((sum, intent) => sum + (intent.filledAt! - intent.createdAt), 0) /
-							completed.filter((intent) => intent.filledAt != null).length,
-					)
-				: 0,
-			window: resolvedWindow,
-		};
+		return solver;
 	}
 
 	private normalizeWindow(window: string): LeaderboardWindow {
 		if (window === "24h" || window === "7d" || window === "30d" || window === "all") {
 			return window;
 		}
-		throw new BadRequestException("Invalid window. Expected one of: 24h, 7d, 30d, all");
+		throw new BadRequestException("Invalid window. Use 24h, 7d, 30d, or all");
 	}
 }

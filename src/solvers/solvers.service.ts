@@ -18,6 +18,39 @@ export function solverSupports(
   return solver.supportedTokens.some((supportedToken) => supportedToken.toUpperCase() === normalizedToken);
 }
 
+/**
+ * True when the solver has advertised enough inventory depth to cover an
+ * intent of `amount` for `(chain, token)` (issue #640).
+ *
+ * Inventory is opt-in: when the solver has no declared entry for the pair the
+ * intent is unaffected. When an entry exists, the intent is only covered if
+ * its source amount does not exceed the declared `availableAmount`.
+ */
+export function solverCoversAmount(
+  solver: Pick<SolverRecord, "inventory">,
+  chain: SupportedChain | string,
+  token: string,
+  amount: string,
+): boolean {
+  const inventory = solver.inventory ?? [];
+  const normalizedToken = token.toUpperCase();
+  const entry = inventory.find(
+    (item) => item.chain === chain && item.token.toUpperCase() === normalizedToken,
+  );
+  if (!entry) return true;
+
+  let declared: bigint;
+  let requested: bigint;
+  try {
+    declared = BigInt(entry.availableAmount);
+    requested = BigInt(amount);
+  } catch {
+    // Unparseable amounts cannot be proven to fit; treat as not covered.
+    return false;
+  }
+  return requested <= declared;
+}
+
 export interface SlashDisputeRecord {
   submittedAt: number;
   reason: string;
@@ -140,6 +173,24 @@ export class SolversService {
   }
 
   /**
+   * Replace a solver's self-reported inventory depth declarations (issue #640).
+   *
+   * The list is replaced wholesale, mirroring how `supportedChains` /
+   * `supportedTokens` are patched. An empty list clears all declarations and
+   * restores the pre-#640 behaviour (no amount filtering).
+   */
+  async updateInventory(
+    address: string,
+    inventory: NonNullable<SolverRecord["inventory"]>,
+  ): Promise<SolverRecord | undefined> {
+    const solver = await this.repo.findByAddress(address);
+    if (!solver) return undefined;
+
+    const updated: SolverRecord = { ...solver, inventory };
+    return this.repo.save(updated);
+  }
+
+  /**
    * Apply a partial patch to a solver's *mutable* profile fields (issue #273).
    *
    * Array fields (`supportedChains`, `supportedTokens`) are replaced wholesale
@@ -213,73 +264,6 @@ export class SolversService {
     const solver = await this.repo.findByAddress(address);
     if (!solver) return null;
     const updated = { ...solver, isActive: false, lastActiveAt: Math.floor(Date.now() / 1000) };
-    return this.repo.save(updated);
-  }
-
-  async reactivate(address: string): Promise<SolverRecord | null> {
-    if (this.isSuspended(address)) {
-      throw new ConflictException("Solver is suspended by an active guardian action");
-    }
-    const solver = await this.repo.findByAddress(address);
-    if (!solver) return null;
-    const updated = { ...solver, isActive: true };
-    return this.repo.save(updated);
-  }
-
-  /**
-   * Register a solver from an on-chain SolverRegistered event (issue #399).
-   *
-   * Creates a new solver record with source="chain" and the bond amount
-   * observed on-chain.  Fields not present in the event (name, supported
-   * chains/tokens) are set to sensible defaults and can be updated later via
-   * POST /solvers metadata update.
-   */
-  async registerFromChain(params: {
-    address: string;
-    bondAmount: string;
-    name: string;
-    isActive: boolean;
-    supportedChains: SolverRecord["supportedChains"];
-    supportedTokens: SolverRecord["supportedTokens"];
-    chainUpdatedLedger: number;
-  }): Promise<SolverRecord> {
-    const now = Math.floor(Date.now() / 1000);
-    const solver: SolverRecord = {
-      address: params.address,
-      name: params.name,
-      bondAmount: params.bondAmount,
-      fillsCompleted: 0,
-      fillsFailed: 0,
-      totalVolume: "0",
-      avgFillTime: 0,
-      isActive: params.isActive,
-      registeredAt: now,
-      lastActiveAt: now,
-      supportedChains: params.supportedChains,
-      supportedTokens: params.supportedTokens,
-      source: "chain",
-      chainUpdatedLedger: params.chainUpdatedLedger,
-    };
-    return this.repo.save(solver);
-  }
-
-  /**
-   * Apply a partial update from an on-chain event projection (issue #399).
-   *
-   * Only the fields present in `update` are changed — all other fields remain
-   * as stored.  Guards on chainUpdatedLedger are enforced by the caller
-   * (SolverRegistryEventsService) before this method is called.
-   *
-   * This is the write path for all chain-sourced projections (BondDeposited,
-   * BondWithdrawn, SolverDeactivated, etc.).
-   */
-  async applyChainUpdate(
-    address: string,
-    update: Partial<Pick<SolverRecord, "bondAmount" | "isActive" | "source" | "chainUpdatedLedger">>,
-  ): Promise<SolverRecord | undefined> {
-    const solver = await this.repo.findByAddress(address);
-    if (!solver) return undefined;
-    const updated: SolverRecord = { ...solver, ...update };
     return this.repo.save(updated);
   }
 }
