@@ -51,6 +51,13 @@ export interface SolverRecord {
    */
   delegatedSigners?: string[];
   /**
+   * Address of the solver that referred this solver at registration time
+   * (issue #641). Set once when the record is created and never mutated
+   * afterward, so past referral attribution survives the referrer later
+   * deregistering. Absent when the solver was not referred.
+   */
+  referredBy?: string;
+  /**
    * Data source for this record (issue #399).
    * "api"   — created / updated via REST POST /solvers.
    * "chain" — projected from solver-registry contract events.

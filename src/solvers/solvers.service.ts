@@ -1,4 +1,4 @@
-import { ConflictException, Inject, Injectable, Logger, Optional } from "@nestjs/common";
+import { BadRequestException, ConflictException, Inject, Injectable, Logger, Optional } from "@nestjs/common";
 import { SupportedChain } from "../intents/intents.types";
 import { SOLVERS_REPOSITORY, ISolversRepository } from "./solvers.repository";
 import { SolverRecord, SolverPendingPenalty, MAX_DELEGATED_SIGNERS } from "./solvers.types";
@@ -115,6 +115,46 @@ export class SolversService {
   }
 
   /**
+   * Resolve a referral code to the referrer's address (issue #641).
+   *
+   * A referral code is simply the referrer's own address. It must resolve to
+   * an existing, active solver and must not be the registrant's own address.
+   *
+   * @returns the referrer address, or `undefined` when no code was supplied.
+   * @throws BadRequestException for self-referral or an unknown/inactive code.
+   */
+  async resolveReferralCode(
+    referralCode: string | undefined,
+    registrantAddress: string,
+  ): Promise<string | undefined> {
+    if (referralCode === undefined || referralCode === null || referralCode === "") {
+      return undefined;
+    }
+    if (referralCode === registrantAddress) {
+      throw new BadRequestException("A solver cannot refer itself");
+    }
+    const referrer = await this.repo.findByAddress(referralCode);
+    if (!referrer || !referrer.isActive) {
+      throw new BadRequestException("Referral code does not resolve to an active solver");
+    }
+    return referrer.address;
+  }
+
+  /**
+   * List the solver addresses referred by `address` (issue #641).
+   *
+   * Derived by scanning for records whose immutable `referredBy` matches the
+   * given address. A referrer that later deregisters keeps its past referral
+   * records intact.
+   */
+  async getReferrals(address: string): Promise<string[]> {
+    const all = await this.repo.findAll();
+    return all
+      .filter((solver) => solver.referredBy === address)
+      .map((solver) => solver.address);
+  }
+
+  /**
    * True when `signer` is the primary address of `solver` or one of its
    * current delegated operational signers (issue #639).
    */
@@ -218,52 +258,6 @@ export class SolversService {
     if (patch.supportedTokens !== undefined) applied.supportedTokens = patch.supportedTokens;
 
     const updated: SolverRecord = { ...solver, ...applied };
-    return this.repo.save(updated);
-  }
-
-  async register(
-    data: Omit<
-      SolverRecord,
-      "registeredAt" | "lastActiveAt" | "fillsCompleted" | "fillsFailed" | "totalVolume"
-    >,
-  ): Promise<SolverRecord> {
-    const now = Math.floor(Date.now() / 1000);
-    const solver: SolverRecord = {
-      ...data,
-      fillsCompleted: 0,
-      fillsFailed: 0,
-      totalVolume: "0",
-      registeredAt: now,
-      lastActiveAt: now,
-    };
-    return this.repo.save(solver);
-  }
-
-  async deregister(address: string): Promise<SolverRecord | undefined> {
-    const solver = await this.repo.findByAddress(address);
-    if (!solver) return undefined;
-    const updated = { ...solver, isActive: false, lastActiveAt: Math.floor(Date.now() / 1000) };
-    return this.repo.save(updated);
-  }
-
-  async markLive(address: string): Promise<SolverRecord | undefined> {
-    const solver = await this.repo.findByAddress(address);
-    if (!solver) return undefined;
-    const updated = { ...solver, isActive: true, lastActiveAt: Math.floor(Date.now() / 1000) };
-    return this.repo.save(updated);
-  }
-
-  async markOffline(address: string): Promise<SolverRecord | undefined> {
-    const solver = await this.repo.findByAddress(address);
-    if (!solver) return undefined;
-    const updated = { ...solver, isActive: false, lastActiveAt: Math.floor(Date.now() / 1000) };
-    return this.repo.save(updated);
-  }
-
-  async deactivate(address: string): Promise<SolverRecord | null> {
-    const solver = await this.repo.findByAddress(address);
-    if (!solver) return null;
-    const updated = { ...solver, isActive: false, lastActiveAt: Math.floor(Date.now() / 1000) };
     return this.repo.save(updated);
   }
 }
