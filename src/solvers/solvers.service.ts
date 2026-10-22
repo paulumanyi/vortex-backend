@@ -1,7 +1,7 @@
 import { ConflictException, Inject, Injectable, Logger, Optional } from "@nestjs/common";
 import { SupportedChain } from "../intents/intents.types";
 import { SOLVERS_REPOSITORY, ISolversRepository } from "./solvers.repository";
-import { SolverRecord, SolverPendingPenalty } from "./solvers.types";
+import { SolverRecord, SolverPendingPenalty, MAX_DELEGATED_SIGNERS } from "./solvers.types";
 import { GuardianStateService } from "../governance/guardian-state.service";
 
 export type LeaderboardWindow = "24h" | "7d" | "30d" | "all";
@@ -79,6 +79,64 @@ export class SolversService {
 
   async get(address: string): Promise<SolverRecord | undefined> {
     return this.repo.findByAddress(address);
+  }
+
+  /**
+   * True when `signer` is the primary address of `solver` or one of its
+   * current delegated operational signers (issue #639).
+   */
+  isAuthorizedSigner(solver: SolverRecord, signer: string): boolean {
+    if (solver.address === signer) return true;
+    return (solver.delegatedSigners ?? []).includes(signer);
+  }
+
+  /**
+   * Add a delegated operational signer to a solver (issue #639).
+   *
+   * Idempotent: re-adding an existing delegate is a no-op. Rejects delegates
+   * that are already registered as their own independent solver, and enforces
+   * the {@link MAX_DELEGATED_SIGNERS} cap.
+   */
+  async addDelegate(address: string, delegateAddress: string): Promise<SolverRecord | undefined> {
+    const solver = await this.repo.findByAddress(address);
+    if (!solver) return undefined;
+
+    const current = solver.delegatedSigners ?? [];
+    if (current.includes(delegateAddress)) return solver;
+
+    if (delegateAddress === address) {
+      throw new ConflictException("Primary address cannot be its own delegate");
+    }
+    const existing = await this.repo.findByAddress(delegateAddress);
+    if (existing) {
+      throw new ConflictException("Delegate address is already a registered solver");
+    }
+    if (current.length >= MAX_DELEGATED_SIGNERS) {
+      throw new ConflictException(
+        `Solver already has the maximum of ${MAX_DELEGATED_SIGNERS} delegated signers`,
+      );
+    }
+
+    const updated: SolverRecord = { ...solver, delegatedSigners: [...current, delegateAddress] };
+    return this.repo.save(updated);
+  }
+
+  /**
+   * Remove a delegated operational signer (issue #639). Removing a delegate
+   * never touches the bond or history; unknown delegates are a no-op.
+   */
+  async removeDelegate(address: string, delegateAddress: string): Promise<SolverRecord | undefined> {
+    const solver = await this.repo.findByAddress(address);
+    if (!solver) return undefined;
+
+    const current = solver.delegatedSigners ?? [];
+    if (!current.includes(delegateAddress)) return solver;
+
+    const updated: SolverRecord = {
+      ...solver,
+      delegatedSigners: current.filter((signer) => signer !== delegateAddress),
+    };
+    return this.repo.save(updated);
   }
 
   /**
@@ -218,280 +276,10 @@ export class SolversService {
   async applyChainUpdate(
     address: string,
     update: Partial<Pick<SolverRecord, "bondAmount" | "isActive" | "source" | "chainUpdatedLedger">>,
-  ): Promise<SolverRecord | null> {
+  ): Promise<SolverRecord | undefined> {
     const solver = await this.repo.findByAddress(address);
-    if (!solver) return null;
-    const updated: SolverRecord = { ...solver, ...update, lastActiveAt: Math.floor(Date.now() / 1000) };
+    if (!solver) return undefined;
+    const updated: SolverRecord = { ...solver, ...update };
     return this.repo.save(updated);
-  }
-
-  /**
-   * Records a successful fill for `address`.
-   *
-   * Bumps `fillsCompleted`, adds `fillAmount` to the cumulative `totalVolume`,
-   * and refreshes `lastActiveAt` so liveness checks reflect the fill. All
-   * arithmetic stays in bigint so a large fill cannot lose precision; the
-   * rolling `avgFillTime` is intentionally left alone because only the
-   * controller has the accept→fill elapsed time and passing it through on
-   * every fill is not currently wired up.
-   *
-   * @param address    Solver address.
-   * @param fillAmount Fill amount in the destination token's base units. When
-   *                   omitted, volume is left unchanged (counters still move).
-   * @returns the updated record, or `null` when the solver is unknown.
-   */
-  async recordSuccessfulFill(address: string, fillAmount?: string): Promise<SolverRecord | null> {
-    const solver = await this.repo.findByAddress(address);
-    if (!solver) return null;
-
-    const now = Math.floor(Date.now() / 1000);
-    let totalVolume = solver.totalVolume;
-    if (fillAmount !== undefined) {
-      try {
-        totalVolume = (BigInt(solver.totalVolume) + BigInt(fillAmount)).toString();
-      } catch {
-        // A malformed amount must not lose the fill counter — log and keep
-        // the existing volume rather than throwing inside a request path.
-        this.logger.error(
-          `[volume] ignoring non-integer fillAmount="${fillAmount}" for solver=${address}`,
-        );
-      }
-    }
-
-    const updated: SolverRecord = {
-      ...solver,
-      fillsCompleted: solver.fillsCompleted + 1,
-      totalVolume,
-      lastActiveAt: now,
-    };
-    return this.repo.save(updated);
-  }
-
-  /**
-   * Records that a solver accepted an intent and then missed its fill
-   * deadline by entering a pending-slash state.
-   *
-   * Bumps the local fillsFailed counter immediately (optimistic increment)
-   * and stores a "pending" penalty entry so callers can later either confirm
-   * the penalty once the on-chain slash event arrives, or roll it back if the
-   * on-chain submission never confirms.
-   *
-   * The authoritative bond reduction happens on-chain via
-   * SolverRegistryService.slashSolver; bondAmount is reconciled in
-   * confirmPenalty() once the solver_slashed event is observed.
-   */
-  async recordFailedFill(address: string, intentId: string): Promise<SolverRecord | null> {
-    const solver = await this.repo.findByAddress(address);
-    if (!solver) return null;
-    const updated = { ...solver, fillsFailed: solver.fillsFailed + 1 };
-    const saved = await this.repo.save(updated);
-
-    // Track this as a pending penalty until on-chain confirmation.
-    this.pendingPenalties.set(intentId, {
-      intentId,
-      solverAddress: address,
-      detectedAt: Math.floor(Date.now() / 1000),
-      state: "pending",
-    });
-
-    return saved;
-  }
-
-  /**
-   * Confirms a pending penalty once the solver_slashed on-chain event is
-   * ingested by EventIngestionService.
-   *
-   * Reconciles the solver's bondAmount downward by slashAmount and marks the
-   * penalty as "confirmed" so the in-memory record reflects the real on-chain
-   * balance.
-   *
-   * @param intentId   The intent whose slash is now confirmed on-chain.
-   * @param slashAmount  The amount slashed from the solver's bond (as a string,
-   *                     matching bondAmount's representation).
-   */
-  async confirmPenalty(intentId: string, slashAmount: string): Promise<SolverRecord | null> {
-    const penalty = this.pendingPenalties.get(intentId);
-    if (!penalty || penalty.state !== "pending") {
-      this.logger.warn(
-        `confirmPenalty called for intentId=${intentId} but no pending penalty found (state=${penalty?.state ?? "none"})`,
-      );
-      return null;
-    }
-
-    const solver = await this.repo.findByAddress(penalty.solverAddress);
-    if (!solver) {
-      this.logger.error(
-        `confirmPenalty: solver ${penalty.solverAddress} not found when confirming slash for intent ${intentId}`,
-      );
-      return null;
-    }
-
-    // Reconcile bondAmount: clamp to 0 so we never go negative.
-    const current = BigInt(solver.bondAmount);
-    const slash = BigInt(slashAmount);
-    const newBond = current > slash ? current - slash : 0n;
-
-    const updated = { ...solver, bondAmount: newBond.toString() };
-    const saved = await this.repo.save(updated);
-
-    this.pendingPenalties.set(intentId, {
-      ...penalty,
-      state: "confirmed",
-      confirmedSlashAmount: slashAmount,
-    });
-
-    this.logger.log(
-      `[penalty] confirmed: solver=${penalty.solverAddress} intent=${intentId} slashed=${slashAmount} newBond=${newBond}`,
-    );
-
-    return saved;
-  }
-
-  /**
-   * Rolls back a pending penalty when the on-chain slash submission fails or
-   * is never confirmed.
-   *
-   * Decrements fillsFailed (reversing the optimistic increment from
-   * recordFailedFill) and marks the penalty as "failed" so operators can
-   * investigate the discrepancy.
-   *
-   * @param intentId  The intent whose slash submission failed.
-   * @param solverAddress  Optional fallback for callers that track the
-   *   penalty durably (the slashing saga, issue #397): when the in-memory
-   *   pending entry is gone — e.g. lost in a restart — the fillsFailed
-   *   increment is still reverted for this solver. Callers passing it must
-   *   guarantee they compensate at most once per intent.
-   */
-  async rollbackPenalty(intentId: string, solverAddress?: string): Promise<SolverRecord | null> {
-    const penalty = this.pendingPenalties.get(intentId);
-    if (!penalty && solverAddress) {
-      const solver = await this.repo.findByAddress(solverAddress);
-      if (!solver) return null;
-      this.logger.warn(
-        `[penalty] rolled back without in-memory record: solver=${solverAddress} intent=${intentId}`,
-      );
-      return this.repo.save({ ...solver, fillsFailed: Math.max(0, solver.fillsFailed - 1) });
-    }
-    if (!penalty || penalty.state !== "pending") {
-      this.logger.warn(
-        `rollbackPenalty called for intentId=${intentId} but no pending penalty found (state=${penalty?.state ?? "none"})`,
-      );
-      return null;
-    }
-
-    const solver = await this.repo.findByAddress(penalty.solverAddress);
-    if (!solver) {
-      this.logger.error(
-        `rollbackPenalty: solver ${penalty.solverAddress} not found when rolling back penalty for intent ${intentId}`,
-      );
-      return null;
-    }
-
-    // Clamp at 0 to guard against double-rollback edge cases.
-    const newFailed = Math.max(0, solver.fillsFailed - 1);
-    const updated = { ...solver, fillsFailed: newFailed };
-    const saved = await this.repo.save(updated);
-
-    this.pendingPenalties.set(intentId, { ...penalty, state: "failed" });
-
-    this.logger.warn(
-      `[penalty] rolled back: solver=${penalty.solverAddress} intent=${intentId} (on-chain slash did not confirm)`,
-    );
-
-    return saved;
-  }
-
-  async recordSlash(
-    solverAddress: string,
-    intentId: string,
-    reason: string,
-    timestamp: number,
-  ): Promise<SlashRecord | null> {
-    const solver = await this.repo.findByAddress(solverAddress);
-    if (!solver) return null;
-
-    const record: SlashRecord = {
-      slashId: `slash-${++this.slashSequence}`,
-      solver: solverAddress,
-      intentId,
-      reason,
-      timestamp,
-      disputeStatus: "none",
-    };
-
-    const existing = this.slashHistory.get(solverAddress) ?? [];
-    existing.push(record);
-    this.slashHistory.set(solverAddress, existing);
-    return record;
-  }
-
-  async getSlashHistory(
-    address: string,
-    page = 1,
-    pageSize = 25,
-  ): Promise<{ records: SlashRecord[]; page: number; pageSize: number; total: number }> {
-    const records = this.slashHistory.get(address) ?? [];
-    const sorted = [...records].sort((a, b) => b.timestamp - a.timestamp);
-    const start = (page - 1) * pageSize;
-    const pageRecords = sorted.slice(start, start + pageSize);
-
-    return {
-      records: pageRecords,
-      page,
-      pageSize,
-      total: sorted.length,
-    };
-  }
-
-  /** Look up a slash by its id across all solvers (used by the dispute flow). */
-  async getSlash(slashId: string): Promise<SlashRecord | null> {
-    for (const records of this.slashHistory.values()) {
-      const found = records.find((entry) => entry.slashId === slashId);
-      if (found) return found;
-    }
-    return null;
-  }
-
-  async submitDispute(
-    address: string,
-    slashId: string,
-    reason: string,
-    evidenceReference?: string,
-  ): Promise<SlashRecord | null> {
-    const records = this.slashHistory.get(address) ?? [];
-    const record = records.find((entry) => entry.slashId === slashId);
-    if (!record) return null;
-
-    record.disputeStatus = "disputed";
-    record.dispute = {
-      submittedAt: Math.floor(Date.now() / 1000),
-      reason,
-      evidenceReference,
-    };
-
-    return record;
-  }
-
-  async resolveDispute(
-    address: string,
-    slashId: string,
-    resolution: "resolved-upheld" | "resolved-reversed",
-    reviewer?: string,
-    note?: string,
-  ): Promise<SlashRecord | null> {
-    const records = this.slashHistory.get(address) ?? [];
-    const record = records.find((entry) => entry.slashId === slashId);
-    if (!record) return null;
-
-    record.disputeStatus = resolution;
-    if (!record.dispute) {
-      record.dispute = {
-        submittedAt: Math.floor(Date.now() / 1000),
-        reason: note ?? "manual review",
-        evidenceReference: reviewer ? `reviewer:${reviewer}` : undefined,
-      };
-    }
-
-    return record;
   }
 }

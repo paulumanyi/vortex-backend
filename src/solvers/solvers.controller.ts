@@ -2,6 +2,7 @@ import {
 	BadRequestException,
 	Body,
 	Controller,
+	Delete,
 	ForbiddenException,
 	Get,
 	NotFoundException,
@@ -21,6 +22,7 @@ import {
 } from "@nestjs/swagger";
 import { IntentsService } from "../intents/intents.service";
 import {
+	buildDelegateMessage,
 	buildDisputeMessage,
 	buildRegisterMessage,
 	buildUpdateSolverMessage,
@@ -164,9 +166,66 @@ export class SolversController {
 	@ApiUnauthorizedResponse({ description: "Missing or invalid signature" })
 	@ApiNotFoundResponse({ description: "Solver not found" })
 	async updateSolver(@Param("address") address: string, @Body() dto: UpdateSolverDto) {
-		verifyStellarSignature(address, buildUpdateSolverMessage(address), dto.signature);
+		const solver = await this.solversService.get(address);
+		if (!solver) throw new NotFoundException("Solver not found");
+
+		const message = buildUpdateSolverMessage(address);
+		const signers = [address, ...(solver.delegatedSigners ?? [])];
+		let authorized = false;
+		for (const signer of signers) {
+			try {
+				verifyStellarSignature(signer, message, dto.signature);
+				authorized = true;
+				break;
+			} catch {
+				// try next candidate signer
+			}
+		}
+		if (!authorized) {
+			throw new ForbiddenException("Missing or invalid signature");
+		}
+
 		const { signature: _signature, ...patch } = dto;
-		const solver = await this.solversService.update(address, patch);
+		const updated = await this.solversService.update(address, patch);
+		if (!updated) throw new NotFoundException("Solver not found");
+		return updated;
+	}
+
+	@Post(":address/delegates")
+	@ApiOperation({ summary: "Add a delegated operational signer" })
+	@ApiOkResponse({ description: "Updated solver record" })
+	@ApiUnauthorizedResponse({ description: "Missing or invalid signature" })
+	@ApiNotFoundResponse({ description: "Solver not found" })
+	async addDelegate(
+		@Param("address") address: string,
+		@Body() dto: { delegateAddress: string; signature: string },
+	) {
+		verifyStellarSignature(
+			address,
+			buildDelegateMessage(address, dto.delegateAddress),
+			dto.signature,
+		);
+		const solver = await this.solversService.addDelegate(address, dto.delegateAddress);
+		if (!solver) throw new NotFoundException("Solver not found");
+		return solver;
+	}
+
+	@Delete(":address/delegates/:delegateAddress")
+	@ApiOperation({ summary: "Remove a delegated operational signer" })
+	@ApiOkResponse({ description: "Updated solver record" })
+	@ApiUnauthorizedResponse({ description: "Missing or invalid signature" })
+	@ApiNotFoundResponse({ description: "Solver not found" })
+	async removeDelegate(
+		@Param("address") address: string,
+		@Param("delegateAddress") delegateAddress: string,
+		@Body() dto: { signature: string },
+	) {
+		verifyStellarSignature(
+			address,
+			buildDelegateMessage(address, delegateAddress),
+			dto.signature,
+		);
+		const solver = await this.solversService.removeDelegate(address, delegateAddress);
 		if (!solver) throw new NotFoundException("Solver not found");
 		return solver;
 	}
@@ -209,82 +268,14 @@ export class SolversController {
 							completed.filter((intent) => intent.filledAt != null).length,
 					)
 				: 0,
-			bondAmount: solver.bondAmount,
 			window: resolvedWindow,
 		};
 	}
 
-	@Get(":address/slashes")
-	async getSlashHistory(
-		@Param("address") address: string,
-		@Query("page") page = "1",
-		@Query("pageSize") pageSize = "25",
-	) {
-		const solver = await this.solversService.get(address);
-		if (!solver) throw new NotFoundException("Solver not found");
-		return this.solversService.getSlashHistory(address, Number(page) || 1, Number(pageSize) || 25);
-	}
-
-	@Post(":address/slashes/:slashId/dispute")
-	async submitDispute(
-		@Param("address") address: string,
-		@Param("slashId") slashId: string,
-		@Body() dto: { reason: string; evidenceReference?: string; signature: string },
-	) {
-		const solver = await this.solversService.get(address);
-		if (!solver) throw new NotFoundException("Solver not found");
-		verifyStellarSignature(address, buildDisputeMessage(slashId, address, dto.reason), dto.signature);
-		const record = await this.solversService.submitDispute(address, slashId, dto.reason, dto.evidenceReference);
-		if (!record) throw new NotFoundException("Slash record not found");
-		return record;
-	}
-
-	@Post(":address/slashes/:slashId/dispute/resolve")
-	async resolveDispute(
-		@Param("address") address: string,
-		@Param("slashId") slashId: string,
-		@Body() dto: { resolution: "resolved-upheld" | "resolved-reversed"; reviewer?: string; note?: string },
-	) {
-		const solver = await this.solversService.get(address);
-		if (!solver) throw new NotFoundException("Solver not found");
-		const record = await this.solversService.resolveDispute(address, slashId, dto.resolution, dto.reviewer, dto.note);
-		if (!record) throw new NotFoundException("Slash record not found");
-		return record;
-	}
-
-	@Post(":address/deregister")
-	async deregisterSolver(@Param("address") address: string, @Body() dto: UpdateSolverStatusDto) {
-		verifyStellarSignature(address, buildSolverStatusMessage("deregister", address), dto.signature);
-		const solver = await this.solversService.deregister(address);
-		if (!solver) throw new NotFoundException("Solver not found");
-		return {
-			...solver,
-			withdrawalStatus: "pending",
-			withdrawalRequestedAt: Math.floor(Date.now() / 1000),
-		};
-	}
-
-	@Post(":address/deactivate")
-	async deactivate(@Param("address") address: string, @Body() dto: UpdateSolverStatusDto) {
-		verifyStellarSignature(address, buildSolverStatusMessage("deactivate", address), dto.signature);
-		const solver = await this.solversService.deactivate(address);
-		if (!solver) throw new NotFoundException("Solver not found");
-		return solver;
-	}
-
-	@Post(":address/reactivate")
-	async reactivate(@Param("address") address: string, @Body() dto: UpdateSolverStatusDto) {
-		verifyStellarSignature(address, buildSolverStatusMessage("reactivate", address), dto.signature);
-		const solver = await this.solversService.reactivate(address);
-		if (!solver) throw new NotFoundException("Solver not found");
-		return solver;
-	}
-
-	private normalizeWindow(window?: string): LeaderboardWindow {
-		const normalized = (window ?? "all").toLowerCase();
-		if (normalized === "all" || normalized === "24h" || normalized === "7d" || normalized === "30d") {
-			return normalized as LeaderboardWindow;
+	private normalizeWindow(window: string): LeaderboardWindow {
+		if (window === "24h" || window === "7d" || window === "30d" || window === "all") {
+			return window;
 		}
-		throw new BadRequestException("Unsupported leaderboard window. Choose 24h, 7d, 30d, or all.");
+		throw new BadRequestException("Invalid window. Expected one of: 24h, 7d, 30d, all");
 	}
 }

@@ -1,5 +1,8 @@
 import { SupportedChain } from "../intents/intents.types";
 
+/** Maximum number of delegated operational signers allowed per solver (issue #639). */
+export const MAX_DELEGATED_SIGNERS = 5;
+
 export interface SolverRecord {
   address: string;
   name: string;
@@ -14,6 +17,17 @@ export interface SolverRecord {
   lastActiveAt: number;
   supportedChains: SupportedChain[];
   supportedTokens: string[];
+  /**
+   * Secondary operational signing keys (issue #639).
+   *
+   * Each entry is a Stellar address that may sign day-to-day operations
+   * (accept / fill / update) on behalf of the primary `address`. The bond,
+   * reputation, and address of record always remain with the primary
+   * `address`; delegates can never deregister or withdraw the bond.
+   *
+   * Capped at MAX_DELEGATED_SIGNERS. Absent/empty means no delegation.
+   */
+  delegatedSigners?: string[];
   /**
    * Data source for this record (issue #399).
    * "api"   — created / updated via REST POST /solvers.
